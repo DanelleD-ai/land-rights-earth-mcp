@@ -102,11 +102,12 @@ export default {
 
 if (authHeader !== `Bearer ${token}`) {
   console.warn("MCP authentication diagnostic", {
-    headerPresent: authHeader !== null,
-    bearerPrefix: authHeader?.startsWith("Bearer ") ?? false,
-    tokenMatches: false
-  });
-
+  headerPresent: authHeader !== null,
+  authScheme: authHeader
+    ? authHeader.trim().split(/\s+/)[0].slice(0, 20)
+    : "missing",
+  bearerPrefix: authHeader?.startsWith("Bearer ") ?? false
+});
   return new Response("Unauthorized", {
     status: 401
   });
