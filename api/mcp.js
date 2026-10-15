@@ -98,12 +98,19 @@ export default {
       });
     }
 
-    if (request.headers.get("authorization") !==
-        `Bearer ${token}`) {
-      return new Response("Unauthorized", {
-        status: 401
-      });
-    }
+   const authHeader = request.headers.get("authorization");
+
+if (authHeader !== `Bearer ${token}`) {
+  console.warn("MCP authentication diagnostic", {
+    headerPresent: authHeader !== null,
+    bearerPrefix: authHeader?.startsWith("Bearer ") ?? false,
+    tokenMatches: false
+  });
+
+  return new Response("Unauthorized", {
+    status: 401
+  });
+}
 
     const server = createServer();
     const transport =
