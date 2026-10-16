@@ -391,6 +391,297 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "measure_route_crossings",
+    {
+      title: "Measure Property Route Crossings",
+      description:
+        "Find Cape Town cadastral parcels intersected by a short proposed route and calculate approximate metres of line inside each property. WGS84 coordinates in [longitude, latitude] order. Preliminary GIS measurements only.",
+      inputSchema: {
+        coordinates: z.array(
+          z.tuple([
+            z.number().min(-180).max(180),
+            z.number().min(-90).max(90)
+          ])
+        ).min(2).max(30)
+      }
+    },
+    async ({ coordinates }) => {
+      try {
+        const xs = coordinates.map(p => p[0]);
+        const ys = coordinates.map(p => p[1]);
+
+        if (
+          Math.max(...xs) - Math.min(...xs) > 0.02 ||
+          Math.max(...ys) - Math.min(...ys) > 0.02
+        ) {
+          throw new Error(
+            "Route extent exceeds 0.02 degrees. Split the route into shorter sections."
+          );
+        }
+
+        // Approximate ground distance between two WGS84 positions.
+        function metres(a, b) {
+          const rad = Math.PI / 180;
+          const dLat = (b[1] - a[1]) * rad;
+          const dLon = (b[0] - a[0]) * rad;
+          const la1 = a[1] * rad;
+          const la2 = b[1] * rad;
+
+          const h =
+            Math.sin(dLat / 2) ** 2 +
+            Math.cos(la1) * Math.cos(la2) *
+            Math.sin(dLon / 2) ** 2;
+
+          return 12742000 * Math.asin(
+            Math.min(1, Math.sqrt(h))
+          );
+        }
+
+        // Even-odd test handles Esri multipart polygons
+        // and their internal holes.
+        function inside(point, rings) {
+          let result = false;
+          const [x, y] = point;
+
+          for (const ring of rings) {
+            for (
+              let i = 0, j = ring.length - 1;
+              i < ring.length;
+              j = i++
+            ) {
+              const a = ring[i];
+              const b = ring[j];
+
+              if (
+                (a[1] > y) !== (b[1] > y) &&
+                x < (b[0] - a[0]) *
+                  (y - a[1]) / (b[1] - a[1]) + a[0]
+              ) {
+                result = !result;
+              }
+            }
+          }
+
+          return result;
+        }
+
+        // Determine where a line segment crosses a
+        // polygon boundary, returning a fraction 0..1.
+        function intersection(a, b, c, d) {
+          const rx = b[0] - a[0];
+          const ry = b[1] - a[1];
+          const sx = d[0] - c[0];
+          const sy = d[1] - c[1];
+          const denominator = rx * sy - ry * sx;
+
+          if (Math.abs(denominator) < 1e-15) {
+            return null;
+          }
+
+          const qx = c[0] - a[0];
+          const qy = c[1] - a[1];
+
+          const t = (qx * sy - qy * sx) / denominator;
+          const u = (qx * ry - qy * rx) / denominator;
+
+          return t >= 0 && t <= 1 && u >= 0 && u <= 1
+            ? t
+            : null;
+        }
+
+        function clippedLength(route, rings) {
+          let total = 0;
+
+          for (let i = 1; i < route.length; i++) {
+            const a = route[i - 1];
+            const b = route[i];
+
+            const fractions = [0, 1];
+
+            for (const ring of rings) {
+              for (let j = 1; j < ring.length; j++) {
+                const t = intersection(
+                  a, b, ring[j - 1], ring[j]
+                );
+                if (t !== null) fractions.push(t);
+              }
+            }
+
+            fractions.sort((a, b) => a - b);
+
+            const unique = fractions.filter(
+              (t, index) =>
+                index === 0 ||
+                t - fractions[index - 1] > 1e-10
+            );
+
+            const length = metres(a, b);
+
+            for (let j = 1; j < unique.length; j++) {
+              const start = unique[j - 1];
+              const end = unique[j];
+
+              if (end - start < 1e-10) continue;
+
+              const mid = (start + end) / 2;
+              const point = [
+                a[0] + mid * (b[0] - a[0]),
+                a[1] + mid * (b[1] - a[1])
+              ];
+
+              if (inside(point, rings)) {
+                total += length * (end - start);
+              }
+            }
+          }
+
+          return total;
+        }
+
+        const params = new URLSearchParams({
+          f: "json",
+          where: "1=1",
+          geometry: JSON.stringify({
+            paths: [coordinates],
+            spatialReference: { wkid: 4326 }
+          }),
+          geometryType: "esriGeometryPolyline",
+          inSR: "4326",
+          spatialRel: "esriSpatialRelIntersects",
+          outFields:
+            "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING",
+          returnGeometry: "true",
+          outSR: "4326",
+          resultRecordCount: "20",
+          orderByFields: "OBJECTID ASC"
+        });
+
+        const features = [];
+        let complete = false;
+
+        // Page through the City's results, with a safety cap.
+        for (let page = 0; page < 10; page++) {
+          params.set(
+            "resultOffset",
+            String(page * 20)
+          );
+
+          const response = await fetch(PROPERTY_API, {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
+            body: params.toString(),
+            signal: AbortSignal.timeout(20000)
+          });
+
+          if (!response.ok) {
+            throw new Error(
+              `City GIS HTTP ${response.status}`
+            );
+          }
+
+          const data = await response.json();
+
+          if (data.error) {
+            throw new Error(
+              data.error.message || "GIS query failed"
+            );
+          }
+
+          const batch = data.features || [];
+          features.push(...batch);
+
+          if (
+            batch.length === 0 ||
+            (batch.length < 20 &&
+             !data.exceededTransferLimit)
+          ) {
+            complete = true;
+            break;
+          }
+        }
+
+        if (!complete) {
+          throw new Error(
+            "Search limit reached. Split route into smaller sections to avoid missing properties."
+          );
+        }
+
+        const results = features.map(feature => {
+          const rings = feature.geometry?.rings;
+
+          if (!rings || !rings.length) {
+            throw new Error(
+              "A property has missing geometry; measurements cannot be completed."
+            );
+          }
+
+          const a = feature.attributes;
+          const length = clippedLength(
+            coordinates, rings
+          );
+
+          return {
+            sg26_code: a.SG26_CODE,
+            erf: a.PRTY_NMBR,
+            address:
+              [a.ADR_NO, a.STR_NAME]
+                .filter(x => x !== null && x !== "")
+                .join(" "),
+            suburb: a.OFC_SBRB_NAME,
+            zoning: a.ZONING,
+            crossing_length_m:
+              Math.round(length * 100) / 100,
+            geometry_intersects_route: true,
+            boundary_touch_or_uncertain:
+              length < 0.01
+          };
+        });
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              coordinate_system: "EPSG:4326",
+              route_length_m:
+                Math.round(
+                  coordinates.slice(1).reduce(
+                    (sum, p, i) =>
+                      sum + metres(coordinates[i], p),
+                    0
+                  ) * 100
+                ) / 100,
+              properties_found: results.length,
+              complete,
+              measurements: results,
+              measurement_method:
+                "Segment-boundary clipping with even-odd polygon inclusion and spherical distance approximation.",
+              cautions: [
+                "Preliminary GIS measurements only.",
+                "Collinear property boundary segments require manual review.",
+                "Distances are approximate, not survey-grade.",
+                "Zero-length intersections may be touches rather than crossings.",
+                "No servitude or corridor width is implied.",
+                "Property geometries and route accuracy must be independently verified."
+              ]
+            })
+          }]
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: error.message
+          }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
