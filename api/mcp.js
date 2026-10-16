@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
+import * as turf from "@turf/turf";
 
 const PROPERTY_API =
   "https://citymaps.capetown.gov.za/agsext/rest/services/Theme_Based/Land_Administration/MapServer/14/query";
@@ -1011,6 +1012,306 @@ function createServer() {
       }
     }
   );
+
+server.registerTool(
+  "analyse_servitude_corridor",
+  {
+    title: "Analyse Proposed Servitude Corridor",
+    description:
+      "Analyse a proposed servitude corridor against City of Cape Town cadastral polygons. Calculate raw property intersection areas, uniquely covered footprint, uncovered area and duplicate-counted area. Preliminary GIS analysis only.",
+    inputSchema: {
+      coordinates: z.array(
+        z.tuple([
+          z.number().min(-180).max(180),
+          z.number().min(-90).max(90)
+        ])
+      ).min(2).max(30),
+      width_m: z.number().min(1).max(100).default(31),
+      include_geometry: z.boolean().default(false)
+    }
+  },
+  async ({ coordinates, width_m, include_geometry }) => {
+    try {
+      const xs = coordinates.map(p => p[0]);
+      const ys = coordinates.map(p => p[1]);
+
+      if (
+        Math.max(...xs) - Math.min(...xs) > 0.02 ||
+        Math.max(...ys) - Math.min(...ys) > 0.02
+      ) {
+        throw new Error(
+          "Route too large. Divide it into shorter sections."
+        );
+      }
+
+      const line = turf.lineString(coordinates);
+
+      // Create a corridor with rounded ends.
+      const corridor = turf.buffer(
+        line,
+        width_m / 2,
+        { units: "meters", steps: 16 }
+      );
+
+      if (!corridor) {
+        throw new Error("Could not generate corridor.");
+      }
+
+      const bbox = turf.bbox(corridor);
+
+      // Query the City's cadastral parcels using
+      // the full corridor bounding box.
+      const params = new URLSearchParams({
+        f: "json",
+        where: "1=1",
+        geometry: bbox.join(","),
+        geometryType: "esriGeometryEnvelope",
+        inSR: "4326",
+        spatialRel: "esriSpatialRelIntersects",
+        outFields:
+          "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING",
+        returnGeometry: "true",
+        outSR: "4326",
+        orderByFields: "OBJECTID ASC",
+        resultRecordCount: "20"
+      });
+
+      const properties = new Map();
+      let complete = false;
+
+      for (let page = 0; page < 10; page++) {
+        params.set("resultOffset", String(page * 20));
+
+        const response = await fetch(PROPERTY_API, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+          body: params.toString(),
+          signal: AbortSignal.timeout(20000)
+        });
+
+        if (!response.ok) {
+          throw new Error(
+            `City GIS returned HTTP ${response.status}`
+          );
+        }
+
+        const data = await response.json();
+
+        if (data.error) {
+          throw new Error(
+            data.error.message || "GIS query failed"
+          );
+        }
+
+        const batch = data.features || [];
+
+        for (const feature of batch) {
+          const id = feature.attributes?.OBJECTID;
+
+          if (
+            id == null ||
+            !feature.geometry?.rings?.length
+          ) {
+            throw new Error(
+              "GIS returned missing property ID or geometry."
+            );
+          }
+
+          properties.set(id, feature);
+        }
+
+        if (
+          batch.length === 0 ||
+          (batch.length < 20 && !data.exceededTransferLimit)
+        ) {
+          complete = true;
+          break;
+        }
+      }
+
+      if (!complete) {
+        throw new Error(
+          "GIS pagination safety limit reached. Reduce the route extent."
+        );
+      }
+
+      const round = n => Math.round(n * 100) / 100;
+
+      const intersections = [];
+      const propertyAreas = [];
+
+      // Convert Esri rings to valid GeoJSON geometry.
+      // Esri polygons can have multiple exterior rings
+      // and interior holes.
+      for (const record of properties.values()) {
+        const a = record.attributes;
+
+        const esriPolygon = {
+          rings: record.geometry.rings,
+          spatialReference: { wkid: 4326 }
+        };
+
+        // Turf can work with GeoJSON, so request the
+        // individual property in GeoJSON format.
+        const detailParams = new URLSearchParams({
+          f: "geojson",
+          where: `OBJECTID=${Number(a.OBJECTID)}`,
+          outFields: "*",
+          returnGeometry: "true",
+          outSR: "4326"
+        });
+
+        const detailResponse = await fetch(
+          PROPERTY_API,
+          {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
+            body: detailParams.toString(),
+            signal: AbortSignal.timeout(20000)
+          }
+        );
+
+        if (!detailResponse.ok) {
+          throw new Error(
+            `GIS geometry request failed: ${detailResponse.status}`
+          );
+        }
+
+        const detail = await detailResponse.json();
+
+        if (detail.error) {
+          throw new Error(
+            detail.error.message || "GeoJSON request failed"
+          );
+        }
+
+        const parcel = detail.features?.[0];
+
+        if (
+          !parcel ||
+          !["Polygon", "MultiPolygon"].includes(
+            parcel.geometry?.type
+          )
+        ) {
+          throw new Error(
+            `Missing GeoJSON polygon for ${a.SG26_CODE}`
+          );
+        }
+
+        const clipped = turf.intersect(
+          turf.featureCollection([corridor, parcel])
+        );
+
+        if (!clipped) continue;
+
+        const area = turf.area(clipped);
+
+        if (area < 0.001) continue;
+
+        intersections.push(clipped);
+
+        propertyAreas.push({
+          sg26_code: a.SG26_CODE,
+          erf: a.PRTY_NMBR,
+          address:
+            [a.ADR_NO, a.STR_NAME]
+              .filter(v => v !== null && v !== "")
+              .join(" "),
+          suburb: a.OFC_SBRB_NAME,
+          zoning: a.ZONING,
+          raw_intersection_m2: round(area),
+          raw_intersection_ha: area / 10000,
+          ...(include_geometry
+            ? { intersected_geometry: clipped.geometry }
+            : {})
+        });
+      }
+
+      // Combine all intersections to eliminate
+      // double counting in total geographical coverage.
+      let union = null;
+
+      if (intersections.length === 1) {
+        union = intersections[0];
+      } else if (intersections.length > 1) {
+        union = turf.union(
+          turf.featureCollection(intersections)
+        );
+      }
+
+      const corridorArea = turf.area(corridor);
+
+      const coveredArea = union
+        ? turf.area(union)
+        : 0;
+
+      const rawSum = intersections.reduce(
+        (sum, polygon) => sum + turf.area(polygon),
+        0
+      );
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            width_m,
+            half_width_m: width_m / 2,
+            route_length_m: round(
+              turf.length(line, {
+                units: "kilometers"
+              }) * 1000
+            ),
+            corridor_area_m2: round(corridorArea),
+            corridor_area_ha: corridorArea / 10000,
+            uniquely_covered_footprint_m2:
+              round(coveredArea),
+            uncovered_footprint_m2:
+              round(Math.max(
+                0,
+                corridorArea - coveredArea
+              )),
+            duplicate_counted_area_m2:
+              round(Math.max(
+                0,
+                rawSum - coveredArea
+              )),
+            properties_intersected:
+              propertyAreas.length,
+            results_complete: complete,
+            property_areas: propertyAreas,
+            ...(include_geometry
+              ? {
+                  corridor_geometry:
+                    corridor.geometry
+                }
+              : {}),
+            cautions: [
+              "Areas are preliminary GIS estimates.",
+              "Raw property areas may overlap.",
+              "Duplicate-counted area does not identify legal ownership.",
+              "The corridor includes rounded end caps.",
+              "No registered servitude is implied.",
+              "Verify cadastral boundaries, title deeds and Surveyor-General diagrams before legal or compensation decisions."
+            ]
+          })
+        }]
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: error.message
+        }]
+      };
+    }
+  }
+);
 
   return server;
 }
