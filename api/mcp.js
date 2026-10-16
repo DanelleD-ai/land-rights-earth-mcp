@@ -84,6 +84,101 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "search_properties",
+    {
+      title: "Search Cape Town Properties",
+      description:
+        "Search City of Cape Town properties by street address, erf number or suburb. Returns matching property records and SG26 codes. For a full property boundary, use get_property_by_sg26.",
+      inputSchema: {
+        search_type: z.enum(["address", "erf", "suburb"]),
+        query: z.string().min(1).max(100),
+        suburb: z.string().max(100).optional()
+      }
+    },
+    async ({ search_type, query, suburb }) => {
+      try {
+        const clean = (value) =>
+          value.trim().toUpperCase()
+            .replace(/'/g, "''")
+            .replace(/[%_]/g, "");
+
+        let where;
+
+        if (search_type === "erf") {
+          const erf = query.trim();
+
+          if (!/^\d{1,15}$/.test(erf)) {
+            throw new Error("Erf number must contain digits only.");
+          }
+
+          where = `PRTY_NMBR='${erf}'`;
+        } else if (search_type === "address") {
+          const match = query.trim().match(/^(\d+)\s+(.+)$/);
+
+          if (match) {
+            where = `ADR_NO=${Number(match[1])} AND UPPER(STR_NAME) LIKE '%${clean(match[2])}%'`;
+          } else {
+            where = `UPPER(STR_NAME) LIKE '%${clean(query)}%'`;
+          }
+        } else {
+          where = `UPPER(OFC_SBRB_NAME) LIKE '%${clean(query)}%'`;
+        }
+
+        if (suburb?.trim()) {
+          where += ` AND UPPER(OFC_SBRB_NAME) LIKE '%${clean(suburb)}%'`;
+        }
+
+        const params = new URLSearchParams({
+          where,
+          outFields: "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING,LU_LGL_STS_DSCR",
+          returnGeometry: "false",
+          resultRecordCount: "10",
+          f: "json"
+        });
+
+        const response = await fetch(
+          `${PROPERTY_API}?${params}`,
+          { signal: AbortSignal.timeout(15000) }
+        );
+
+        if (!response.ok) {
+          throw new Error(`City GIS returned HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (data.error) {
+          throw new Error(data.error.message || "GIS query failed");
+        }
+
+        const properties = (data.features || []).map(
+          (feature) => feature.attributes
+        );
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              count_returned: properties.length,
+              more_results_possible: Boolean(data.exceededTransferLimit),
+              properties,
+              note: "Search results are limited to 10. Confirm the correct SG26 code before retrieving a property boundary."
+            })
+          }]
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: error.message
+          }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
