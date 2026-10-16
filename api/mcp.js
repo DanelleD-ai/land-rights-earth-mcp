@@ -280,6 +280,117 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "find_properties_along_route",
+    {
+      title: "Find Properties Along a Route",
+      description:
+        "Find City of Cape Town cadastral properties intersecting a proposed line route. Accepts WGS84 longitude-latitude coordinate pairs. This identifies potential affected parcels but does not yet calculate crossing lengths.",
+      inputSchema: {
+        coordinates: z.array(
+          z.tuple([
+            z.number().min(-180).max(180),
+            z.number().min(-90).max(90)
+          ])
+        ).min(2).max(30),
+        offset: z.number().int().min(0).max(100000).default(0),
+        include_geometry: z.boolean().default(false)
+      }
+    },
+    async ({ coordinates, offset, include_geometry }) => {
+      try {
+        const lngs = coordinates.map(p => p[0]);
+        const lats = coordinates.map(p => p[1]);
+
+        const width = Math.max(...lngs) - Math.min(...lngs);
+        const height = Math.max(...lats) - Math.min(...lats);
+
+        if (width > 0.02 || height > 0.02) {
+          throw new Error(
+            "Route too large for one request. Divide it into shorter sections, each within a 0.02-degree bounding box."
+          );
+        }
+
+        const pageSize = 20;
+
+        const line = {
+          paths: [coordinates],
+          spatialReference: { wkid: 4326 }
+        };
+
+        const params = new URLSearchParams({
+          f: "json",
+          where: "1=1",
+          geometry: JSON.stringify(line),
+          geometryType: "esriGeometryPolyline",
+          inSR: "4326",
+          spatialRel: "esriSpatialRelIntersects",
+          outFields:
+            "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING,LU_LGL_STS_DSCR",
+          returnGeometry: String(include_geometry),
+          outSR: "4326",
+          resultOffset: String(offset),
+          resultRecordCount: String(pageSize),
+          orderByFields: "OBJECTID ASC"
+        });
+
+        const response = await fetch(PROPERTY_API, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded"
+          },
+          body: params.toString(),
+          signal: AbortSignal.timeout(20000)
+        });
+
+        if (!response.ok) {
+          throw new Error(`City GIS returned HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (data.error) {
+          throw new Error(data.error.message || "Route query failed");
+        }
+
+        const features = data.features || [];
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              route: coordinates,
+              coordinate_system: "EPSG:4326",
+              count_returned: features.length,
+              offset,
+              next_offset: features.length === pageSize
+                ? offset + features.length
+                : null,
+              exceeded_transfer_limit:
+                Boolean(data.exceededTransferLimit),
+              properties: features.map(feature => ({
+                attributes: feature.attributes,
+                ...(include_geometry
+                  ? { geometry: feature.geometry }
+                  : {})
+              })),
+              important:
+                "Results identify polygons intersecting or touching the route. This is not a verified servitude or construction corridor. Crossing lengths have not been calculated. Continue pagination if a full page is returned."
+            })
+          }]
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: error.message
+          }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
