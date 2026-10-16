@@ -1313,6 +1313,229 @@ server.registerTool(
   }
 );
 
+server.registerTool(
+  "search_properties_along_long_route",
+  {
+    title: "Find Properties Along a Long Route",
+    description:
+      "Search Cape Town cadastral properties intersecting a long WGS84 route. Automatically divides the route into short GIS query sections. Supports resumable batches. Deduplicate properties across batches using SG26 codes. Does not measure crossing lengths or corridor areas.",
+    inputSchema: {
+      coordinates: z.array(
+        z.tuple([
+          z.number().min(-180).max(180),
+          z.number().min(-90).max(90)
+        ])
+      ).min(2).max(1500),
+      chunk_offset: z.number().int().min(0).default(0)
+    }
+  },
+  async ({ coordinates, chunk_offset }) => {
+    try {
+      // Divide long straight legs into smaller pieces.
+      // This prevents a single long segment from
+      // exceeding the City's query-size limits.
+      const densified = [coordinates[0]];
+
+      for (let i = 1; i < coordinates.length; i++) {
+        const a = coordinates[i - 1];
+        const b = coordinates[i];
+
+        const steps = Math.max(
+          1,
+          Math.ceil(
+            Math.max(
+              Math.abs(b[0] - a[0]),
+              Math.abs(b[1] - a[1])
+            ) / 0.008
+          )
+        );
+
+        for (let s = 1; s <= steps; s++) {
+          const t = s / steps;
+          densified.push([
+            a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t
+          ]);
+        }
+
+        if (densified.length > 5000) {
+          throw new Error(
+            "Route too large for this version. Split the alignment into separate sections."
+          );
+        }
+      }
+
+      // Build short, overlapping-at-endpoint sections.
+      // Each section contains at most 20 positions.
+      const chunks = [];
+      let current = [densified[0]];
+
+      for (let i = 1; i < densified.length; i++) {
+        const candidate = [...current, densified[i]];
+        const xs = candidate.map(p => p[0]);
+        const ys = candidate.map(p => p[1]);
+
+        const tooLarge =
+          candidate.length > 20 ||
+          Math.max(...xs) - Math.min(...xs) > 0.016 ||
+          Math.max(...ys) - Math.min(...ys) > 0.016;
+
+        if (tooLarge && current.length >= 2) {
+          chunks.push(current);
+          current = [
+            current[current.length - 1],
+            densified[i]
+          ];
+        } else {
+          current = candidate;
+        }
+      }
+
+      if (current.length >= 2) chunks.push(current);
+
+      if (chunk_offset >= chunks.length) {
+        throw new Error("chunk_offset exceeds the route's chunk count.");
+      }
+
+      // Limit each invocation to five GIS sections
+      // to avoid long serverless execution times.
+      const end = Math.min(chunk_offset + 5, chunks.length);
+      const found = new Map();
+
+      for (let c = chunk_offset; c < end; c++) {
+        const params = new URLSearchParams({
+          f: "json",
+          where: "1=1",
+          geometry: JSON.stringify({
+            paths: [chunks[c]],
+            spatialReference: { wkid: 4326 }
+          }),
+          geometryType: "esriGeometryPolyline",
+          inSR: "4326",
+          spatialRel: "esriSpatialRelIntersects",
+          outFields:
+            "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING",
+          returnGeometry: "false",
+          outSR: "4326",
+          resultRecordCount: "100",
+          orderByFields: "OBJECTID ASC"
+        });
+
+        let finished = false;
+
+        for (let page = 0; page < 10; page++) {
+          params.set("resultOffset", String(page * 100));
+
+          const response = await fetch(PROPERTY_API, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: params.toString(),
+            signal: AbortSignal.timeout(20000)
+          });
+
+          if (!response.ok) {
+            throw new Error(
+              `GIS HTTP ${response.status} in section ${c}`
+            );
+          }
+
+          const data = await response.json();
+
+          if (data.error) {
+            throw new Error(
+              data.error.message || "GIS query failed"
+            );
+          }
+
+          const batch = data.features || [];
+
+          for (const feature of batch) {
+            const a = feature.attributes;
+            if (
+              a?.OBJECTID == null ||
+              !a.SG26_CODE
+            ) {
+              throw new Error(
+                `Missing property identifier in section ${c}`
+              );
+            }
+            found.set(a.SG26_CODE, a);
+          }
+
+          if (
+            batch.length === 0 ||
+            (batch.length < 100 &&
+              !data.exceededTransferLimit)
+          ) {
+            finished = true;
+            break;
+          }
+        }
+
+        if (!finished) {
+          throw new Error(
+            `Too many GIS results in section ${c}. Reduce the route section size.`
+          );
+        }
+      }
+
+      const properties = [...found.values()].map(a => ({
+        sg26_code: a.SG26_CODE,
+        erf: a.PRTY_NMBR,
+        address: [a.ADR_NO, a.STR_NAME]
+          .filter(v => v !== null && v !== "")
+          .join(" "),
+        suburb: a.OFC_SBRB_NAME,
+        zoning: a.ZONING
+      }));
+
+      const next = end < chunks.length ? end : null;
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            coordinate_system: "EPSG:4326",
+            route_length_m: Math.round(
+              turf.length(
+                turf.lineString(coordinates),
+                { units: "kilometers" }
+              ) * 1000
+            ),
+            original_vertices: coordinates.length,
+            total_sections: chunks.length,
+            processed_section_start: chunk_offset,
+            processed_section_end_exclusive: end,
+            next_chunk_offset: next,
+            entire_route_processed: next === null,
+            unique_properties_in_this_batch: properties.length,
+            properties,
+            instructions:
+              "If next_chunk_offset is not null, call this tool again with the same full coordinates and that offset. Deduplicate SG26 codes across batches. Do not claim complete coverage until all batches have succeeded.",
+            cautions: [
+              "Only City of Cape Town cadastral coverage is searched.",
+              "Results are preliminary GIS intersections, not confirmed legal ownership.",
+              "Properties repeated in multiple sections must be counted once.",
+              "This tool does not measure crossing lengths or corridor areas.",
+              "Verify SG diagrams, title deeds and registered servitudes independently."
+            ]
+          })
+        }]
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: error.message
+        }]
+      };
+    }
+  }
+);
+
   return server;
 }
 
