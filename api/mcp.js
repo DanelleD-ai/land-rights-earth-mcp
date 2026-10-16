@@ -682,6 +682,336 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "analyse_route_overlaps",
+    {
+      title: "Analyse Route and Cadastral Overlaps",
+      description:
+        "Split a short proposed route into sections by cadastral boundary intersections. Report section lengths and all covering SG26 polygons. Flag ambiguous overlapping coverage, uncovered sections and boundary-following geometry. No legal allocation is made.",
+      inputSchema: {
+        coordinates: z.array(
+          z.tuple([
+            z.number().min(-180).max(180),
+            z.number().min(-90).max(90)
+          ])
+        ).min(2).max(30)
+      }
+    },
+    async ({ coordinates }) => {
+      try {
+        const xs = coordinates.map(p => p[0]);
+        const ys = coordinates.map(p => p[1]);
+
+        if (
+          Math.max(...xs) - Math.min(...xs) > 0.02 ||
+          Math.max(...ys) - Math.min(...ys) > 0.02
+        ) {
+          throw new Error(
+            "Route too large. Split into shorter sections."
+          );
+        }
+
+        const cross = (a, b) =>
+          a[0] * b[1] - a[1] * b[0];
+
+        const subtract = (a, b) =>
+          [a[0] - b[0], a[1] - b[1]];
+
+        const pointAt = (a, b, t) => [
+          a[0] + (b[0] - a[0]) * t,
+          a[1] + (b[1] - a[1]) * t
+        ];
+
+        function metres(a, b) {
+          const r = Math.PI / 180;
+          const dLat = (b[1] - a[1]) * r;
+          const dLon = (b[0] - a[0]) * r;
+
+          const h =
+            Math.sin(dLat / 2) ** 2 +
+            Math.cos(a[1] * r) *
+            Math.cos(b[1] * r) *
+            Math.sin(dLon / 2) ** 2;
+
+          return 12742000 *
+            Math.asin(Math.min(1, Math.sqrt(h)));
+        }
+
+        function onEdge(p, a, b) {
+          const ab = subtract(b, a);
+          const ap = subtract(p, a);
+          const length = Math.hypot(...ab);
+
+          if (length === 0) return false;
+
+          return (
+            Math.abs(cross(ab, ap)) / length < 1e-10 &&
+            ap[0] * ab[0] + ap[1] * ab[1] >= -1e-12 &&
+            ap[0] * ab[0] + ap[1] * ab[1] <=
+              ab[0] ** 2 + ab[1] ** 2 + 1e-12
+          );
+        }
+
+        function coverage(p, rings) {
+          let inside = false;
+          let boundary = false;
+
+          for (const ring of rings) {
+            for (let j = 0; j < ring.length - 1; j++) {
+              const a = ring[j];
+              const b = ring[j + 1];
+
+              if (onEdge(p, a, b)) boundary = true;
+
+              if (
+                (a[1] > p[1]) !== (b[1] > p[1]) &&
+                p[0] <
+                  (b[0] - a[0]) *
+                  (p[1] - a[1]) /
+                  (b[1] - a[1]) + a[0]
+              ) {
+                inside = !inside;
+              }
+            }
+          }
+
+          return { inside, boundary };
+        }
+
+        function breakpoints(a, b, features) {
+          const values = [0, 1];
+          const r = subtract(b, a);
+
+          for (const f of features) {
+            for (const ring of f.geometry.rings) {
+              for (let j = 0; j < ring.length - 1; j++) {
+                const c = ring[j];
+                const d = ring[j + 1];
+                const s = subtract(d, c);
+                const q = subtract(c, a);
+                const den = cross(r, s);
+
+                if (Math.abs(den) < 1e-15) {
+                  // Collinear edges will be detected by
+                  // midpoint boundary classification.
+                  if (Math.abs(cross(q, r)) < 1e-15) {
+                    const rr = r[0] ** 2 + r[1] ** 2;
+                    if (rr > 0) {
+                      for (const p of [c, d]) {
+                        const v = subtract(p, a);
+                        values.push(Math.max(0, Math.min(1,
+                          (v[0] * r[0] + v[1] * r[1]) / rr
+                        )));
+                      }
+                    }
+                  }
+                  continue;
+                }
+
+                const t = cross(q, s) / den;
+                const u = cross(q, r) / den;
+
+                if (
+                  t >= 0 && t <= 1 &&
+                  u >= 0 && u <= 1
+                ) {
+                  values.push(t);
+                }
+              }
+            }
+          }
+
+          return values.sort((x, y) => x - y)
+            .filter((v, i, arr) =>
+              i === 0 || v - arr[i - 1] > 1e-10
+            );
+        }
+
+        const base = new URLSearchParams({
+          f: "json",
+          where: "1=1",
+          geometry: JSON.stringify({
+            paths: [coordinates],
+            spatialReference: { wkid: 4326 }
+          }),
+          geometryType: "esriGeometryPolyline",
+          inSR: "4326",
+          spatialRel: "esriSpatialRelIntersects",
+          outFields:
+            "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,ZONING",
+          returnGeometry: "true",
+          outSR: "4326",
+          resultRecordCount: "20",
+          orderByFields: "OBJECTID ASC"
+        });
+
+        const found = new Map();
+        let complete = false;
+
+        for (let page = 0; page < 10; page++) {
+          base.set("resultOffset", String(page * 20));
+
+          const response = await fetch(PROPERTY_API, {
+            method: "POST",
+            headers: {
+              "Content-Type":
+                "application/x-www-form-urlencoded"
+            },
+            body: base.toString(),
+            signal: AbortSignal.timeout(20000)
+          });
+
+          if (!response.ok) {
+            throw new Error(`GIS HTTP ${response.status}`);
+          }
+
+          const data = await response.json();
+
+          if (data.error) {
+            throw new Error(data.error.message);
+          }
+
+          const batch = data.features || [];
+
+          for (const f of batch) {
+            if (!f.geometry?.rings?.length) {
+              throw new Error(
+                "Missing property geometry. Analysis incomplete."
+              );
+            }
+            found.set(f.attributes.OBJECTID, f);
+          }
+
+          if (
+            batch.length === 0 ||
+            (batch.length < 20 &&
+              !data.exceededTransferLimit)
+          ) {
+            complete = true;
+            break;
+          }
+        }
+
+        if (!complete) {
+          throw new Error(
+            "GIS pagination safety limit reached. Split the route."
+          );
+        }
+
+        const features = [...found.values()];
+        const sections = [];
+        let routeLength = 0;
+
+        for (let i = 1; i < coordinates.length; i++) {
+          const a = coordinates[i - 1];
+          const b = coordinates[i];
+          const legLength = metres(a, b);
+          routeLength += legLength;
+
+          const cuts = breakpoints(a, b, features);
+
+          for (let j = 1; j < cuts.length; j++) {
+            const t0 = cuts[j - 1];
+            const t1 = cuts[j];
+
+            if (t1 - t0 < 1e-10) continue;
+
+            const mid = pointAt(a, b, (t0 + t1) / 2);
+            const matched = [];
+            let boundary = false;
+
+            for (const f of features) {
+              const result = coverage(
+                mid, f.geometry.rings
+              );
+
+              if (result.boundary) boundary = true;
+
+              if (result.inside || result.boundary) {
+                matched.push(f.attributes.SG26_CODE);
+              }
+            }
+
+            const status = boundary
+              ? "boundary_uncertain"
+              : matched.length > 1
+                ? "overlapping"
+                : matched.length === 1
+                  ? "single_polygon"
+                  : "uncovered";
+
+            sections.push({
+              segment: i,
+              start: pointAt(a, b, t0),
+              end: pointAt(a, b, t1),
+              length_m: legLength * (t1 - t0),
+              status,
+              covering_sg26_codes: matched
+            });
+          }
+        }
+
+        const summary = {
+          single_polygon_m: 0,
+          overlapping_m: 0,
+          uncovered_m: 0,
+          boundary_uncertain_m: 0
+        };
+
+        for (const section of sections) {
+          summary[section.status + "_m"] += section.length_m;
+        }
+
+        const round = n => Math.round(n * 100) / 100;
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              route_length_m: round(routeLength),
+              analysis_complete: complete,
+              properties_found: features.length,
+              properties: features.map(f => ({
+                sg26_code: f.attributes.SG26_CODE,
+                erf: f.attributes.PRTY_NMBR,
+                address: [
+                  f.attributes.ADR_NO,
+                  f.attributes.STR_NAME
+                ].filter(v => v !== null && v !== "")
+                  .join(" "),
+                zoning: f.attributes.ZONING
+              })),
+              summary_m: Object.fromEntries(
+                Object.entries(summary).map(
+                  ([key, value]) => [key, round(value)]
+                )
+              ),
+              sections: sections.map(s => ({
+                ...s,
+                length_m: round(s.length_m)
+              })),
+              warnings: [
+                "Overlapping GIS polygons are not allocated to individual legal properties.",
+                "Boundary-following sections require review.",
+                "Spherical WGS84 distances are approximate.",
+                "Only City of Cape Town GIS coverage is queried.",
+                "Verify SG diagrams and registered cadastral extents before legal, compensation or servitude decisions."
+              ]
+            })
+          }]
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: error.message
+          }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
