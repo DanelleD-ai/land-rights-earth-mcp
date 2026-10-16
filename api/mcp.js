@@ -13,24 +13,34 @@ function createServer() {
     version: "1.0.0"
   });
 
-  server.registerTool(
-    "get_property_by_sg26",
-    {
-      title: "Find Cape Town Property",
-      description:
-        "Find a City of Cape Town property by its exact SG26 cadastral code. Returns property details, zoning and polygon coordinates.",
-      inputSchema: {
-        sg26_code: z.string().min(1).max(26)
+
+server.registerTool(
+  "get_property_by_sg26",
+  {
+    title: "Find Cape Town Property by SG Code",
+    description:
+      "Find a Cape Town property using its supplied SG identifier. Accepts different SG-code formats. Attempts an exact match first, then returns possible prefix matches without changing the original identifier.",
+    inputSchema: {
+      sg26_code: z.string().min(1).max(26)
+    }
+  },
+  async ({ sg26_code }) => {
+    try {
+      const originalCode = sg26_code.trim().toUpperCase();
+
+      if (!/^[A-Z0-9]+$/.test(originalCode)) {
+        throw new Error(
+          "SG code must contain letters and numbers only."
+        );
       }
-    },
-    async ({ sg26_code }) => {
-      try {
+
+      async function queryProperties(where, fields, geometry) {
         const params = new URLSearchParams({
-          where: "SG26_CODE='" +
-            sg26_code.replace(/'/g, "''") + "'",
-          outFields: "*",
-          returnGeometry: "true",
+          where,
+          outFields: fields,
+          returnGeometry: String(geometry),
           outSR: "4326",
+          resultRecordCount: "100",
           f: "json"
         });
 
@@ -40,50 +50,90 @@ function createServer() {
         );
 
         if (!response.ok) {
-          throw new Error("City GIS API unavailable");
+          throw new Error(
+            `City GIS API returned HTTP ${response.status}`
+          );
         }
 
         const data = await response.json();
 
         if (data.error) {
-          throw new Error(data.error.message || "GIS query failed");
+          throw new Error(
+            data.error.message || "GIS query failed"
+          );
         }
 
-        const features = data.features || [];
+        return data;
+      }
 
-        if (features.length === 0) {
-          return {
-            content: [{
-              type: "text",
-              text: "No property found with that SG26 code."
-            }]
-          };
-        }
+      const escapeSql = value =>
+        value.replace(/'/g, "''");
 
+      // 1. Try the supplied SG code exactly.
+      const exact = await queryProperties(
+        `SG26_CODE='${escapeSql(originalCode)}'`,
+        "*",
+        true
+      );
+
+      if (exact.features?.length) {
         return {
           content: [{
             type: "text",
             text: JSON.stringify({
-              count: features.length,
-              properties: features.map(feature => ({
-                attributes: feature.attributes,
-                geometry: feature.geometry
+              supplied_code: sg26_code,
+              match_type: "exact",
+              match_count: exact.features.length,
+              properties: exact.features.map(f => ({
+                attributes: f.attributes,
+                geometry: f.geometry
               }))
             })
           }]
         };
-
-      } catch (error) {
-        return {
-          isError: true,
-          content: [{
-            type: "text",
-            text: error.message
-          }]
-        };
       }
+
+      // 2. If no exact match exists, search possible
+      // database representations using the supplied prefix.
+      const candidates = await queryProperties(
+        `SG26_CODE LIKE '${escapeSql(originalCode)}%'`,
+        "SG26_CODE,PRTY_NMBR,STR_NAME,OFC_SBRB_NAME,ZONING",
+        false
+      );
+
+      const matches = candidates.features || [];
+
+      return {
+        content: [{
+          type: "text",
+          text: JSON.stringify({
+            supplied_code: sg26_code,
+            match_type: matches.length
+              ? "prefix_candidate"
+              : "not_found",
+            match_count: matches.length,
+            possible_matches: matches.map(f => f.attributes),
+            confirmation_required: matches.length > 1,
+            note: matches.length === 1
+              ? "One possible matching City GIS record was found. The supplied identifier has not been proven legally equivalent to the City's stored SG26 code. Use the exact returned SG26 code to retrieve its full geometry."
+              : matches.length > 1
+                ? "Multiple possible matching records found. Confirm the intended property before retrieving full information."
+                : "No matching City GIS property was found. The supplied identifier was not modified."
+          })
+        }]
+      };
+    } catch (error) {
+      return {
+        isError: true,
+        content: [{
+          type: "text",
+          text: error.message
+        }]
+      };
     }
-  );
+  }
+);
+
 
   server.registerTool(
     "search_properties",
