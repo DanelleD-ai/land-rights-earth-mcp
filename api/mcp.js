@@ -179,6 +179,107 @@ function createServer() {
     }
   );
 
+  server.registerTool(
+    "search_properties_in_area",
+    {
+      title: "Find Properties in a Geographic Area",
+      description:
+        "Find Cape Town cadastral properties intersecting a rectangular geographic area. Coordinates must be WGS84 longitude/latitude. Supports pagination and optional property polygons.",
+      inputSchema: {
+        west: z.number().min(-180).max(180),
+        south: z.number().min(-90).max(90),
+        east: z.number().min(-180).max(180),
+        north: z.number().min(-90).max(90),
+        offset: z.number().int().min(0).max(100000).default(0),
+        include_geometry: z.boolean().default(false)
+      }
+    },
+    async ({ west, south, east, north, offset, include_geometry }) => {
+      try {
+        if (west >= east || south >= north) {
+          throw new Error("Invalid area: west must be less than east, and south less than north.");
+        }
+
+        if (east - west > 0.02 || north - south > 0.02) {
+          throw new Error(
+            "Area too large. Use a box no wider or taller than 0.02 degrees. Divide larger areas into smaller boxes."
+          );
+        }
+
+        const pageSize = 20;
+
+        const params = new URLSearchParams({
+          where: "1=1",
+          geometry: `${west},${south},${east},${north}`,
+          geometryType: "esriGeometryEnvelope",
+          inSR: "4326",
+          spatialRel: "esriSpatialRelIntersects",
+          outFields:
+            "OBJECTID,SG26_CODE,PRTY_NMBR,ADR_NO,STR_NAME,OFC_SBRB_NAME,ZONING,LU_LGL_STS_DSCR",
+          returnGeometry: String(include_geometry),
+          outSR: "4326",
+          resultOffset: String(offset),
+          resultRecordCount: String(pageSize),
+          orderByFields: "OBJECTID ASC",
+          f: "json"
+        });
+
+        const response = await fetch(
+          `${PROPERTY_API}?${params}`,
+          { signal: AbortSignal.timeout(20000) }
+        );
+
+        if (!response.ok) {
+          throw new Error(`City GIS returned HTTP ${response.status}`);
+        }
+
+        const data = await response.json();
+
+        if (data.error) {
+          throw new Error(data.error.message || "GIS spatial query failed");
+        }
+
+        const features = data.features || [];
+
+        return {
+          content: [{
+            type: "text",
+            text: JSON.stringify({
+              searched_area: { west, south, east, north },
+              coordinate_system: "EPSG:4326",
+              spatial_relationship: "intersects",
+              count_returned: features.length,
+              offset,
+              next_offset:
+                features.length === pageSize
+                  ? offset + features.length
+                  : null,
+              next_page_may_exist: features.length === pageSize,
+              exceeded_transfer_limit:
+                Boolean(data.exceededTransferLimit),
+              properties: features.map(feature => ({
+                attributes: feature.attributes,
+                ...(include_geometry
+                  ? { geometry: feature.geometry }
+                  : {})
+              })),
+              note:
+                "Results cover a rectangular search area, not an exact route corridor. A full page may indicate additional records. Continue pagination until an incomplete or empty page."
+            })
+          }]
+        };
+      } catch (error) {
+        return {
+          isError: true,
+          content: [{
+            type: "text",
+            text: error.message
+          }]
+        };
+      }
+    }
+  );
+
   return server;
 }
 
